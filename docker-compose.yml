@@ -1,0 +1,27 @@
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: miniapp
+      POSTGRES_PASSWORD: miniapp
+      POSTGRES_DB: miniapp
+    volumes:
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "127.0.0.1:5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U miniapp"]
+      interval: 2s
+      retries: 15
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://miniapp:miniapp@db:5432/miniapp
+      JWT_SECRET: dev-only-change-me
+    ports:
+      # Bound to localhost only: this version is deliberately vulnerable.
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
