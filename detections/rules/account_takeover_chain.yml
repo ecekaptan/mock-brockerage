@@ -1,0 +1,104 @@
+# Account takeover: a login from a country the user has never logged in from,
+# then the payout IBAN is changed, then money is withdrawn, all within 15 minutes.
+# Each step alone is normal (people travel, change banks, withdraw). The
+# sequence in a short window is the attack.
+
+title: MiniApp login from a new country for this user
+id: 57a90a5b-3064-4f8e-a36a-a18f2da7c748
+name: miniapp_login_new_country
+status: experimental
+description: >
+  Successful login from a country not seen before for this user.
+  `country_first_seen` is not written by the app. The log pipeline adds it
+  (detect.py's enrich step), the same way a SIEM would with an Elastic
+  "new terms" rule or a Splunk lookup of each user's known countries. A user's
+  very first login sets their baseline and is never flagged.
+author: ecekaptan
+date: 2026-11-22
+tags:
+  - attack.initial-access
+  - attack.t1078
+logsource:
+  product: miniapp
+  service: security
+detection:
+  selection:
+    event: login_success
+    country_first_seen: true
+  condition: selection
+falsepositives:
+  - Travel, VPNs
+level: low
+---
+title: MiniApp payout IBAN changed
+id: 4864988e-60c4-473e-af11-598298b2d73d
+name: miniapp_iban_changed
+status: experimental
+description: The account's payout IBAN was changed.
+author: ecekaptan
+date: 2026-11-22
+tags:
+  - attack.persistence
+  - attack.t1098
+logsource:
+  product: miniapp
+  service: security
+detection:
+  selection:
+    event: iban_changed
+  condition: selection
+falsepositives:
+  - Customers changing banks
+level: informational
+---
+title: MiniApp withdrawal sent
+id: de02044b-0c81-440e-8499-f7db19929a1c
+name: miniapp_withdraw_sent
+status: experimental
+description: A withdrawal was paid out to the account's IBAN.
+author: ecekaptan
+date: 2026-11-22
+tags:
+  - attack.impact
+  - attack.t1657
+logsource:
+  product: miniapp
+  service: security
+detection:
+  selection:
+    event: withdraw
+  condition: selection
+falsepositives:
+  - Normal withdrawals
+level: informational
+---
+title: Account takeover chain - new-country login, IBAN change, withdrawal
+id: a4e0e532-86ed-45ef-b6fd-79abdbd35b4f
+status: experimental
+description: >
+  For one user, in this order within 15 minutes: a login from a new country,
+  a payout IBAN change, and a withdrawal. This is the classic brokerage
+  takeover: stolen credentials, redirect payouts to the attacker's account,
+  drain the balance. In production this should hold the withdrawal for review,
+  not only raise an alert.
+author: ecekaptan
+date: 2026-11-22
+tags:
+  - attack.initial-access
+  - attack.t1078
+  - attack.persistence
+  - attack.t1098
+  - attack.impact
+  - attack.t1657
+correlation:
+  type: temporal_ordered
+  rules:
+    - miniapp_login_new_country
+    - miniapp_iban_changed
+    - miniapp_withdraw_sent
+  group-by:
+    - user
+  timespan: 15m
+falsepositives:
+  - A customer who moved abroad, opened a local bank account and withdrew on the same day
+level: critical

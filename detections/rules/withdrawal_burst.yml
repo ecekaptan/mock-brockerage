@@ -1,0 +1,55 @@
+# The race-condition signature (VULN 1): many withdrawals from one user in about
+# one second. Counts both paid and rejected attempts, so it fires on the
+# vulnerable app (20 payouts) and on the fixed app (1 payout + 19 rejections).
+
+title: MiniApp withdrawal attempt
+id: df6404e5-4caf-4a6f-b78e-c00a234ace3e
+name: miniapp_withdraw_attempt
+status: experimental
+description: >
+  Any withdrawal attempt, paid (`withdraw`) or refused (`withdraw_rejected`:
+  insufficient balance, duplicate idempotency key, no IBAN).
+author: ecekaptan
+date: 2026-11-22
+tags:
+  - attack.impact
+  - attack.t1657
+logsource:
+  product: miniapp
+  service: security
+detection:
+  selection:
+    event:
+      - withdraw
+      - withdraw_rejected
+  condition: selection
+falsepositives:
+  - Normal withdrawals
+level: informational
+---
+title: Withdrawal burst - concurrent withdrawals from one user (race condition)
+id: e0c0efd5-e6bd-4aa3-bf7f-730f223534ec
+status: experimental
+description: >
+  5 or more withdrawal attempts by one user within 1 second. A person can't
+  press the button that fast. Scripted parallel requests trying to beat a
+  check-then-act race can.
+author: ecekaptan
+date: 2026-11-22
+tags:
+  - attack.initial-access
+  - attack.t1190
+  - attack.impact
+  - attack.t1657
+correlation:
+  type: event_count
+  rules:
+    - miniapp_withdraw_attempt
+  group-by:
+    - user
+  timespan: 1s
+  condition:
+    gte: 5
+falsepositives:
+  - A buggy client retrying in a tight loop (usually with the same Idempotency-Key, so reason=duplicate)
+level: high

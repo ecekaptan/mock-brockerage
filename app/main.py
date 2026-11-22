@@ -9,6 +9,7 @@ report "[-] Not exploited".
   3. Business logic on POST /orders     -> quantity must be > 0 (validated)
   4. No rate limiting on POST /login    -> per-IP limit via slowapi
 """
+import os
 from contextlib import asynccontextmanager
 from decimal import Decimal
 from typing import Annotated, Literal, Optional
@@ -17,7 +18,6 @@ from fastapi import Depends, FastAPI, Header, HTTPException, Request
 from pydantic import BaseModel, Field
 from slowapi import Limiter
 from slowapi.errors import RateLimitExceeded
-from slowapi.util import get_remote_address
 
 from .auth import create_token, current_user, hash_password, verify_password
 from .db import pool
@@ -36,7 +36,18 @@ starting_balance = Decimal("1000.00")
 demo_users = [("ali", "Password123!", "TR000000000000000000000001"),
               ("veli", "Password123!", "TR000000000000000000000002")]
 
-limiter = Limiter(key_func=get_remote_address)
+# How many proxies we run in front of the app (each appends one X-Forwarded-For
+# entry). 0 = none (local docker compose). Set it per deployment, e.g. 1 behind a
+# single load balancer, and confirm it against a real request before relying on it.
+TRUSTED_PROXY_HOPS = int(os.environ.get("TRUSTED_PROXY_HOPS", "0"))
+
+# FIX (VULN 4): slowapi's get_remote_address keys on request.client.host, the TCP
+# peer. Behind a front end (Cloud Run, a load balancer) that peer is the proxy, so
+# every user would share ONE bucket: 5 bad logins from anyone would lock everyone
+# out, and the per-attacker limit would mean nothing. Key on the real client IP.
+# Note: limits are kept in memory per instance, so they are only exact with a
+# single instance; use a shared store (e.g. Redis) when scaling out.
+limiter = Limiter(key_func=lambda request: client_ip(request) or "unknown")
 
 
 def seed_demo_users() -> None:
@@ -80,11 +91,27 @@ def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
     raise HTTPException(status_code=429, detail="Too many requests")
 
 
+def client_ip(request: Request) -> Optional[str]:
+    # FIX (XFF spoofing): the old code took the FIRST X-Forwarded-For entry, which
+    # is whatever the client typed, so a "trustworthy" log IP was attacker-chosen.
+    # Each proxy APPENDS the address it received the request from, so only the
+    # entries added by our own proxies can be trusted: counting from the right,
+    # entry number TRUSTED_PROXY_HOPS is the real client. Everything to its left
+    # is client-supplied. With 0 hops (local compose, nothing in front) the header
+    # is ignored entirely and we use the TCP peer, since trusting it there would
+    # let anyone pick their own IP.
+    peer = request.client.host if request.client else None
+    if TRUSTED_PROXY_HOPS == 0:
+        return peer
+    entries = [e.strip() for e in request.headers.get("x-forwarded-for", "").split(",") if e.strip()]
+    if len(entries) < TRUSTED_PROXY_HOPS:
+        return peer  # header shorter than our own proxy chain: not set by our proxies
+    return entries[-TRUSTED_PROXY_HOPS]
+
+
 def client_ctx(request: Request) -> dict:
-    forwarded = request.headers.get("x-forwarded-for")
-    ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else None)
     return {
-        "ip": ip,
+        "ip": client_ip(request),
         "country": request.headers.get("x-client-country", "TR"),
         "user_agent": request.headers.get("user-agent"),
     }
@@ -249,6 +276,11 @@ def get_order(order_id: int, request: Request, user: dict = Depends(current_user
             "SELECT * FROM orders WHERE id = %s AND user_id = %s", (order_id, user["id"])
         ).fetchone()
         if not order:
+            # DETECTION: log the refused read. The fix stops the leak, but a user
+            # walking order ids is still an attack worth seeing (rule:
+            # detections/rules/order_enumeration.yml).
+            security_event("order_read_denied", user=user["username"], order_id=order_id,
+                           **client_ctx(request))
             raise HTTPException(status_code=404, detail="Order not found")
     security_event("order_read", user=user["username"], order_id=order_id, **client_ctx(request))
     return order
@@ -264,6 +296,8 @@ def withdraw(
     with pool.connection() as conn, conn.transaction():
         iban = conn.execute("SELECT iban FROM users WHERE id = %s", (user["id"],)).fetchone()["iban"]
         if not iban:
+            security_event("withdraw_rejected", user=user["username"], amount=body.amount,
+                           reason="no_iban", **client_ctx(request))
             raise HTTPException(status_code=400, detail="No IBAN on file")
 
         # fix (vulnerability 1): replay protection. A repeated key is a no-op, so a
@@ -274,6 +308,8 @@ def withdraw(
                 (user["id"], idempotency_key),
             ).fetchone()
             if seen:
+                security_event("withdraw_rejected", user=user["username"], amount=body.amount,
+                               reason="duplicate", **client_ctx(request))
                 bal = conn.execute(
                     "SELECT balance FROM accounts WHERE user_id = %s", (user["id"],)
                 ).fetchone()["balance"]
@@ -288,6 +324,11 @@ def withdraw(
             (body.amount, user["id"], body.amount),
         ).fetchone()
         if row is None:
+            # DETECTION: log the attempts the fix rejects. Without this, the race
+            # attack leaves a single "withdraw" line on the fixed app and the
+            # burst rule (detections/rules/withdrawal_burst.yml) can't see it.
+            security_event("withdraw_rejected", user=user["username"], amount=body.amount,
+                           reason="insufficient_balance", **client_ctx(request))
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
         conn.execute(

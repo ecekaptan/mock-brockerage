@@ -3,10 +3,13 @@ services:
     image: postgres:16
     environment:
       POSTGRES_USER: miniapp
-      POSTGRES_PASSWORD: miniapp
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
       POSTGRES_DB: miniapp
+      # Password for the limited role the app uses (db/app_role.sh).
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}
     volumes:
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - ./db/app_role.sh:/docker-entrypoint-initdb.d/zz_app_role.sh:ro
     # No host port: the database is reachable only from the api service on the
     # internal compose network, never from your laptop. Uncomment to debug.
     # ports:
@@ -21,9 +24,13 @@ services:
   api:
     build: .
     environment:
-      DATABASE_URL: postgresql://miniapp:miniapp@db:5432/miniapp
-      # Supply a real secret via a .env file (see .env.example)
-      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me}
+      # The app connects as miniapp_app, not the superuser (see db/app_role.sh).
+      DATABASE_URL: postgresql://miniapp_app:${APP_DB_PASSWORD:?set APP_DB_PASSWORD in .env}@db:5432/miniapp
+      # No default: the app refuses to start without a real secret (app/auth.py).
+      JWT_SECRET: ${JWT_SECRET:?set JWT_SECRET in .env}
+      # Proxies in front that append X-Forwarded-For (see client_ip in app/main.py).
+      # 0 = none. detections/generate_sample.sh sets 1 to simulate a load balancer.
+      TRUSTED_PROXY_HOPS: ${TRUSTED_PROXY_HOPS:-0}
     ports:
       - "127.0.0.1:8000:8000"
     depends_on:

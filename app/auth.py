@@ -6,7 +6,23 @@ import jwt
 from fastapi import Depends, HTTPException
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
-JWT_SECRET = os.environ.get("JWT_SECRET", "dev-only")
+
+def _load_jwt_secret() -> str:
+    # FIX (weak JWT secret): this used to fall back to "dev-only" when the
+    # variable was missing, so a deploy that forgot it signed tokens with a key
+    # anyone can read in this repo, and anyone could forge a login. Now the app
+    # refuses to start instead.
+    secret = os.environ.get("JWT_SECRET", "")
+    placeholders = {"dev-only", "dev-only-change-me", "change-me-to-a-long-random-value"}
+    if len(secret) < 32 or secret in placeholders:
+        raise RuntimeError(
+            "JWT_SECRET must be set to a random value of at least 32 characters, "
+            "e.g. python -c 'import secrets; print(secrets.token_urlsafe(32))'"
+        )
+    return secret
+
+
+JWT_SECRET = _load_jwt_secret()
 JWT_ALG = "HS256"
 TOKEN_TTL = timedelta(hours=1)
 

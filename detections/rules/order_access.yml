@@ -1,0 +1,83 @@
+# Order access abuse (VULN 2).
+# Rule 1 catches a successful IDOR: a user read an order they don't own. Only
+# the vulnerable app can produce this event (it logs order_owner), so it is
+# validated against detections/samples/vulnerable.jsonl.
+# Rules 2-3 catch the attempt on the fixed app: many refused reads by one user.
+
+title: IDOR - user read an order belonging to someone else
+id: 10b9446a-0593-4983-b0e0-9802d712f3b3
+status: experimental
+description: >
+  An order_read where the caller is not the order's owner. The fixed app's
+  ownership check makes this impossible, so any hit means the check is
+  missing or was bypassed, and customer trade data (KVKK personal data) leaked.
+author: ecekaptan
+date: 2026-11-22
+tags:
+  - attack.initial-access
+  - attack.t1190
+  - attack.collection
+  - attack.t1213
+logsource:
+  product: miniapp
+  service: security
+detection:
+  selection:
+    event: order_read
+  own_order:
+    user|fieldref: order_owner
+  filter_no_owner:
+    order_owner: null
+  condition: selection and not own_order and not filter_no_owner
+falsepositives:
+  - None expected. Support staff reading customer orders should use a separate, audited endpoint
+level: high
+---
+title: MiniApp order read refused
+id: 1b44d121-6911-4fbc-8ffd-0472bc7b685f
+name: miniapp_order_read_denied
+status: experimental
+description: >
+  GET /orders/{id} returned 404 because the order doesn't exist or isn't the
+  caller's.
+author: ecekaptan
+date: 2026-11-22
+tags:
+  - attack.discovery
+logsource:
+  product: miniapp
+  service: security
+detection:
+  selection:
+    event: order_read_denied
+  condition: selection
+falsepositives:
+  - Stale links
+level: informational
+---
+title: Order ID enumeration - many refused order reads by one user
+id: b64adecc-969e-4787-825a-bee06029fd9b
+status: experimental
+description: >
+  10 or more refused order reads by one user within 1 minute: someone walking
+  the order-id space looking for an IDOR. On the fixed app the attempt fails
+  but is still worth investigating (and the account worth rate limiting).
+author: ecekaptan
+date: 2026-11-22
+tags:
+  - attack.initial-access
+  - attack.t1190
+  - attack.collection
+  - attack.t1213
+correlation:
+  type: event_count
+  rules:
+    - miniapp_order_read_denied
+  group-by:
+    - user
+  timespan: 1m
+  condition:
+    gte: 10
+falsepositives:
+  - A client app bug requesting a deleted order in a loop
+level: medium
