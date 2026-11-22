@@ -1,0 +1,11 @@
+.git
+.gitignore
+.venv
+exploits/.venv
+__pycache__
+*.pyc
+.env
+*.tfstate*
+.terraform
+README.md
+FIXES.md

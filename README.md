@@ -1,6 +1,6 @@
 # Security Assessment of a Mock Brokerage Platform
 
-A small FastAPI + PostgreSQL trading API with four planted, fintech-specific vulnerabilities. The project shows the full loop: **build → attack → fix → deploy (GCP + Terraform) → detect (Log Analytics + Sigma)**.
+A small FastAPI + PostgreSQL trading API with four planted, fintech-specific vulnerabilities. The project shows the full loop: **build → attack → fix → deploy securely (GCP + Terraform) → detect (Log Analytics + Sigma)**.
 
 ## Quick start
 
@@ -19,13 +19,13 @@ Python (PEP 668), so use a virtual environment:
 ```bash
 cd exploits
 python3 -m venv .venv
-source .venv/bin/activate          
+source .venv/bin/activate          # each new terminal needs this again
 pip install -r requirements.txt
 
-python race_withdraw.py            # vulnerability 1 — drains 20x the balance
-python idor_orders.py              # vulnerability 2 — reads another user's orders
-python negative_quantity.py        # vulnerability 3 — mints money from a negative buy
-python credential_stuffing.py      # vulnerability 4 — brute forces login, unthrottled
+python race_withdraw.py            # VULN 1 — drains 20x the balance
+python idor_orders.py              # VULN 2 — reads another user's orders
+python negative_quantity.py        # VULN 3 — mints money from a negative buy
+python credential_stuffing.py      # VULN 4 — brute forces login, unthrottled
 ```
 
 Each script prints a before/after and ends with `[!] EXPLOITED` or `[-] Not
@@ -48,7 +48,7 @@ default to `http://localhost:8000`; override with `TARGET=...`.
 
 ## Added vulnerabilities
 
-Search the code for `vulnerability`.
+Search the code for `VULN`.
 
 | # | Bug | Where | Impact for a real brokerage |
 |---|---|---|---|

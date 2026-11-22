@@ -7,8 +7,12 @@ services:
       POSTGRES_DB: miniapp
     volumes:
       - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
-    ports:
-      - "127.0.0.1:5432:5432"
+    # No host port: the database is reachable only from the api service on the
+    # internal compose network, never from your laptop. Uncomment to debug.
+    # ports:
+    #   - "127.0.0.1:5432:5432"
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U miniapp"]
       interval: 2s
@@ -18,10 +22,19 @@ services:
     build: .
     environment:
       DATABASE_URL: postgresql://miniapp:miniapp@db:5432/miniapp
-      JWT_SECRET: dev-only-change-me
+      # Supply a real secret via a .env file (see .env.example)
+      JWT_SECRET: ${JWT_SECRET:-dev-only-change-me}
     ports:
-      # Bound to localhost only: this version is deliberately vulnerable.
       - "127.0.0.1:8000:8000"
     depends_on:
       db:
         condition: service_healthy
+    # --- Runtime hardening ---
+    security_opt:
+      - no-new-privileges:true      # process can't gain privileges via setuid
+    cap_drop:
+      - ALL                         # drop all Linux capabilities
+    read_only: true                 # immutable root filesystem
+    tmpfs:
+      - /tmp                        # the one writable path, in memory
+    restart: unless-stopped
