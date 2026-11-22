@@ -1,4 +1,4 @@
--- schema (intentionally vulnerable training app)
+-- schema (fixed version)
 
 CREATE TABLE users (
     id            SERIAL PRIMARY KEY,
@@ -8,10 +8,11 @@ CREATE TABLE users (
     created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- NOTE: no CHECK (balance >= 0) on purpose. Adding it is part of the fix.
+-- fix (vulnerability 1): CHECK constraint is a last line of defense. Even if application
+-- logic is bypassed, the database refuses to let a balance go negative.
 CREATE TABLE accounts (
     user_id  INTEGER PRIMARY KEY REFERENCES users(id),
-    balance  NUMERIC(18, 2) NOT NULL DEFAULT 0
+    balance  NUMERIC(18, 2) NOT NULL DEFAULT 0 CHECK (balance >= 0)
 );
 
 CREATE TABLE holdings (
@@ -26,17 +27,24 @@ CREATE TABLE orders (
     user_id    INTEGER NOT NULL REFERENCES users(id),
     symbol     TEXT NOT NULL,
     side       TEXT NOT NULL,
-    quantity   NUMERIC(18, 4) NOT NULL,
+    quantity   NUMERIC(18, 4) NOT NULL CHECK (quantity > 0),
     price      NUMERIC(18, 2) NOT NULL,
     total      NUMERIC(18, 2) NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 
--- NOTE: no idempotency_key column yet. Adding it (with a UNIQUE index) is part of the fix.
+-- fix (vulnerability 1): idempotency_key makes a retried/duplicated withdrawal a no-op.
+-- The partial UNIQUE index guarantees one payout per (user, key) even under
+-- concurrent requests.
 CREATE TABLE withdrawals (
-    id         SERIAL PRIMARY KEY,
-    user_id    INTEGER NOT NULL REFERENCES users(id),
-    amount     NUMERIC(18, 2) NOT NULL,
-    iban       TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    id              SERIAL PRIMARY KEY,
+    user_id         INTEGER NOT NULL REFERENCES users(id),
+    amount          NUMERIC(18, 2) NOT NULL,
+    iban            TEXT NOT NULL,
+    idempotency_key TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+
+CREATE UNIQUE INDEX withdrawals_user_idem
+    ON withdrawals (user_id, idempotency_key)
+    WHERE idempotency_key IS NOT NULL;

@@ -1,20 +1,23 @@
-"""a deliberately vulnerable mock brokerage API.
+"""a mock brokerage API — FIXED version.
 
-FOR SECURITY TRAINING ONLY. Run locally with fake data.
+Companion to the `vulnerable` branch. Each fix is marked "FIX" and maps to the
+bug it closes. Run the exploit scripts against this version: they should all
+report "[-] Not exploited".
 
-Added vulnerabilities (search for "VULN"):
-  1. Race condition on POST /withdraw   (check-then-act, no lock, no idempotency)
-  2. IDOR on GET /orders/{order_id}     (no ownership check)
-  3. Business logic on POST /orders     (negative quantity accepted)
-  4. No rate limiting on POST /login    (credential stuffing / brute force)
+  1. Race condition on POST /withdraw  -> atomic conditional UPDATE + idempotency key
+  2. IDOR on GET /orders/{order_id}     -> ownership check in the query
+  3. Business logic on POST /orders     -> quantity must be > 0 (validated)
+  4. No rate limiting on POST /login    -> per-IP limit via slowapi
 """
-import time
 from contextlib import asynccontextmanager
 from decimal import Decimal
-from typing import Literal
+from typing import Annotated, Literal, Optional
 
-from fastapi import Depends, FastAPI, HTTPException, Request
-from pydantic import BaseModel
+from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from pydantic import BaseModel, Field
+from slowapi import Limiter
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from .auth import create_token, current_user, hash_password, verify_password
 from .db import pool
@@ -33,6 +36,8 @@ starting_balance = Decimal("1000.00")
 demo_users = [("ali", "Password123!", "TR000000000000000000000001"),
               ("veli", "Password123!", "TR000000000000000000000002")]
 
+limiter = Limiter(key_func=get_remote_address)
+
 
 def seed_demo_users() -> None:
     with pool.connection() as conn:
@@ -49,7 +54,6 @@ def seed_demo_users() -> None:
                     "INSERT INTO accounts (user_id, balance) VALUES (%s, %s)",
                     (user["id"], starting_balance),
                 )
-                # Give each demo user one order so the IDOR has something to find.
                 conn.execute(
                     "INSERT INTO orders (user_id, symbol, side, quantity, price, total) "
                     "VALUES (%s, 'THYAO', 'buy', 1, 310.50, 310.50)",
@@ -65,16 +69,18 @@ async def lifespan(app: FastAPI):
     pool.close()
 
 
-app = FastAPI(title="MiniApp (vulnerable)", lifespan=lifespan)
+app = FastAPI(title="MiniApp (fixed)", lifespan=lifespan)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    # fix (vulnerability 4): refuse and log instead of answering unlimited guesses.
+    security_event("rate_limited", path=request.url.path, **client_ctx(request))
+    raise HTTPException(status_code=429, detail="Too many requests")
 
 
 def client_ctx(request: Request) -> dict:
-    """Who is calling, for the logs.
-
-    X-Client-Country simulates the geo header a load balancer adds in
-    production (e.g. Google Cloud's X-Client-Geo-Location). Exploit scripts
-    set it to fake logins from different countries.
-    """
     forwarded = request.headers.get("x-forwarded-for")
     ip = forwarded.split(",")[0].strip() if forwarded else (request.client.host if request.client else None)
     return {
@@ -94,12 +100,13 @@ class Credentials(BaseModel):
 class OrderIn(BaseModel):
     symbol: str
     side: Literal["buy", "sell"]
-    # VULN 3: no constraint on quantity — zero and negative values are accepted.
-    quantity: Decimal
+    # fix (vulnerability 3): quantity must be strictly positive. A negative or zero
+    # quantity is rejected at the edge with a 422 before any logic runs.
+    quantity: Annotated[Decimal, Field(gt=0)]
 
 
 class WithdrawIn(BaseModel):
-    amount: Decimal
+    amount: Annotated[Decimal, Field(gt=0)]
 
 
 class IbanIn(BaseModel):
@@ -114,6 +121,7 @@ def health():
 
 
 @app.post("/register", status_code=201)
+@limiter.limit("10/minute")
 def register(body: Credentials, request: Request):
     with pool.connection() as conn:
         if conn.execute("SELECT 1 FROM users WHERE username = %s", (body.username,)).fetchone():
@@ -132,8 +140,10 @@ def register(body: Credentials, request: Request):
 
 
 @app.post("/login")
+@limiter.limit("5/minute")
 def login(body: Credentials, request: Request):
-    # VULN 4: no rate limiting, no lockout, no CAPTCHA. Unlimited guesses per IP/user.
+    # fix (vulnerability 4): slowapi caps attempts per IP. Brute force / credential
+    # stuffing now hits 429 long before it can walk a wordlist.
     ctx = client_ctx(request)
     with pool.connection() as conn:
         user = conn.execute(
@@ -163,8 +173,6 @@ def me(user: dict = Depends(current_user)):
 
 @app.put("/me/iban")
 def change_iban(body: IbanIn, request: Request, user: dict = Depends(current_user)):
-    # Not a planted bug, but note for the README: production should require
-    # step-up auth (OTP) and a cooling-off period before a new IBAN can receive money.
     with pool.connection() as conn:
         old = conn.execute("SELECT iban FROM users WHERE id = %s", (user["id"],)).fetchone()
         conn.execute("UPDATE users SET iban = %s WHERE id = %s", (body.iban, user["id"]))
@@ -184,11 +192,12 @@ def place_order(body: OrderIn, request: Request, user: dict = Depends(current_us
     if symbol not in prices:
         raise HTTPException(status_code=400, detail="Unknown symbol")
     price = prices[symbol]
+    # quantity is guaranteed > 0 by the schema, so total is always positive.
     total = (body.quantity * price).quantize(Decimal("0.01"))
 
     with pool.connection() as conn, conn.transaction():
         balance = conn.execute(
-            "SELECT balance FROM accounts WHERE user_id = %s", (user["id"],)
+            "SELECT balance FROM accounts WHERE user_id = %s FOR UPDATE", (user["id"],)
         ).fetchone()["balance"]
         held = conn.execute(
             "SELECT quantity FROM holdings WHERE user_id = %s AND symbol = %s", (user["id"], symbol)
@@ -196,8 +205,6 @@ def place_order(body: OrderIn, request: Request, user: dict = Depends(current_us
         held_qty = held["quantity"] if held else Decimal("0")
 
         if body.side == "buy":
-            # VULN 3: with quantity < 0, total is negative, so this check always
-            # passes and "balance - total" ADDS money to the account.
             if balance < total:
                 raise HTTPException(status_code=400, detail="Insufficient balance")
             balance_delta, qty_delta = -total, body.quantity
@@ -236,48 +243,59 @@ def my_orders(user: dict = Depends(current_user)):
 @app.get("/orders/{order_id}")
 def get_order(order_id: int, request: Request, user: dict = Depends(current_user)):
     with pool.connection() as conn:
-        # VULN 2: looks the order up by ID only. Any logged-in user can read
-        # any other user's orders by changing the number in the URL.
-        order = conn.execute("SELECT * FROM orders WHERE id = %s", (order_id,)).fetchone()
+        # fix (vulnerability 2): scope the lookup to the caller. Another user's id simply
+        # returns 404 — we don't even confirm the order exists.
+        order = conn.execute(
+            "SELECT * FROM orders WHERE id = %s AND user_id = %s", (order_id, user["id"])
+        ).fetchone()
         if not order:
             raise HTTPException(status_code=404, detail="Order not found")
-        owner = conn.execute("SELECT username FROM users WHERE id = %s", (order["user_id"],)).fetchone()
-    security_event("order_read", user=user["username"], order_id=order_id,
-                   order_owner=owner["username"], **client_ctx(request))
+    security_event("order_read", user=user["username"], order_id=order_id, **client_ctx(request))
     return order
 
 
 @app.post("/withdraw")
-def withdraw(body: WithdrawIn, request: Request, user: dict = Depends(current_user)):
-    if body.amount <= 0:
-        raise HTTPException(status_code=400, detail="Amount must be positive")
-
-    with pool.connection() as conn:
-        # VULN 1: classic check-then-act race condition.
-        # Step 1 reads the balance with no lock and no transaction...
-        row = conn.execute(
-            "SELECT a.balance, u.iban FROM accounts a JOIN users u ON u.id = a.user_id "
-            "WHERE a.user_id = %s",
-            (user["id"],),
-        ).fetchone()
-        if not row["iban"]:
+def withdraw(
+    body: WithdrawIn,
+    request: Request,
+    user: dict = Depends(current_user),
+    idempotency_key: Optional[str] = Header(default=None, alias="Idempotency-Key"),
+):
+    with pool.connection() as conn, conn.transaction():
+        iban = conn.execute("SELECT iban FROM users WHERE id = %s", (user["id"],)).fetchone()["iban"]
+        if not iban:
             raise HTTPException(status_code=400, detail="No IBAN on file")
-        if row["balance"] < body.amount:
+
+        # fix (vulnerability 1): replay protection. A repeated key is a no-op, so a
+        # double-submitted request never pays out twice.
+        if idempotency_key:
+            seen = conn.execute(
+                "SELECT 1 FROM withdrawals WHERE user_id = %s AND idempotency_key = %s",
+                (user["id"], idempotency_key),
+            ).fetchone()
+            if seen:
+                bal = conn.execute(
+                    "SELECT balance FROM accounts WHERE user_id = %s", (user["id"],)
+                ).fetchone()["balance"]
+                return {"status": "duplicate_ignored", "amount": body.amount, "balance": bal}
+
+        # fix (vulnerability 1): single atomic conditional decrement. The row is debited
+        # only if it still holds enough; concurrent requests that lose the race
+        # get no row back and are rejected. No check-then-act window.
+        row = conn.execute(
+            "UPDATE accounts SET balance = balance - %s "
+            "WHERE user_id = %s AND balance >= %s RETURNING balance",
+            (body.amount, user["id"], body.amount),
+        ).fetchone()
+        if row is None:
             raise HTTPException(status_code=400, detail="Insufficient balance")
 
-        # Step 2 simulates the call to the bank/payment provider (~200 ms).
-        # Every concurrent request has already passed the check above.
-        time.sleep(0.2)
-
-        # Step 3 writes back a value computed from the stale read (lost update),
-        # and records a payout for every request that got this far.
-        new_balance = row["balance"] - body.amount
-        conn.execute("UPDATE accounts SET balance = %s WHERE user_id = %s", (new_balance, user["id"]))
         conn.execute(
-            "INSERT INTO withdrawals (user_id, amount, iban) VALUES (%s, %s, %s)",
-            (user["id"], body.amount, row["iban"]),
+            "INSERT INTO withdrawals (user_id, amount, iban, idempotency_key) VALUES (%s, %s, %s, %s)",
+            (user["id"], body.amount, iban, idempotency_key),
         )
+        new_balance = row["balance"]
 
-    security_event("withdraw", user=user["username"], amount=body.amount,
-                   iban=row["iban"], **client_ctx(request))
+    security_event("withdraw", user=user["username"], amount=body.amount, iban=iban,
+                   **client_ctx(request))
     return {"status": "sent", "amount": body.amount, "balance": new_balance}
